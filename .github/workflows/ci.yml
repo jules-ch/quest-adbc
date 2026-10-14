@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked
+      - run: cargo build --release --locked --features ffi
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - run: docker compose up -d --wait
+      - run: cargo test --locked --test integration -- --nocapture
+        env:
+          QUESTDB_ADBC_TEST_URI: ws://localhost:9000
+      - if: always()
+        run: docker compose down -v

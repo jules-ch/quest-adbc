@@ -1,0 +1,31 @@
+[package]
+name = "adbc-questdb"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.1"
+description = "Arrow Database Connectivity driver for QuestDB over QWP/WebSocket"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/YOUR_GITHUB/adbc-questdb"
+
+[lib]
+name = "adbc_questdb"
+crate-type = ["lib", "cdylib"]
+
+[features]
+default = []
+ffi = ["dep:adbc_ffi"]
+
+[dependencies]
+adbc_core = "0.24.0"
+adbc_ffi = { version = "0.24.0", optional = true }
+arrow-array = "=59.3.0"
+arrow-schema = "=59.3.0"
+questdb-rs = { version = "7.0.0", default-features = false, features = ["arrow-egress", "sync-reader-zstd", "tls-webpki-certs", "ring-crypto"] }
+url = "2.5.8"
+
+[dev-dependencies]
+arrow = "=59.3.0"
+
+[[test]]
+name = "integration"
+path = "tests/it/main.rs"
