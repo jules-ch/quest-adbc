@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use adbc_core::error::{Error, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
@@ -6,19 +7,28 @@ use adbc_core::{Optionable, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 
-use crate::reader::QuestDbBatchReader;
+use crate::cancellation::{CancellationRegistry, QueryCancellation};
+use crate::connection::NativeConnection;
+use crate::reader::QuestDbArrowStreamReader;
 use crate::writer;
 
 pub struct QuestDbStatement {
-    pub(crate) conf: String,
+    connection: Arc<NativeConnection>,
+    cancellation: Arc<CancellationRegistry>,
+    active: Option<Weak<QueryCancellation>>,
     sql: Option<String>,
     options: HashMap<String, String>,
 }
 
 impl QuestDbStatement {
-    pub(crate) fn new(conf: String) -> Self {
+    pub(crate) fn new(
+        connection: Arc<NativeConnection>,
+        cancellation: Arc<CancellationRegistry>,
+    ) -> Self {
         Self {
-            conf,
+            connection,
+            cancellation,
+            active: None,
             sql: None,
             options: HashMap::new(),
         }
@@ -44,10 +54,19 @@ impl Statement for QuestDbStatement {
                 Status::InvalidState,
             )
         })?;
-        Ok(Box::new(QuestDbBatchReader::execute(
-            self.conf.clone(),
-            sql,
-        )?))
+        // ADBC semantics: a second Execute on the same statement invalidates
+        // the first call's result set. The invalidated stream reports its
+        // cancellation when it is next advanced; until it has released the
+        // connection, a new execute is refused with InvalidState.
+        if let Some(previous) = self.active.as_ref().and_then(Weak::upgrade) {
+            previous.request();
+        }
+        let query = Arc::new(QueryCancellation::default());
+        let reader =
+            QuestDbArrowStreamReader::execute(self.connection.acquire()?, sql, Arc::clone(&query))?;
+        self.cancellation.register(&query);
+        self.active = Some(Arc::downgrade(&query));
+        Ok(Box::new(reader))
     }
 
     fn execute_update(&mut self) -> adbc_core::error::Result<Option<i64>> {
@@ -95,8 +114,12 @@ impl Statement for QuestDbStatement {
     }
 
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
-        // Dropping the returned ADBC reader drops its channel receiver; the
-        // worker observes that and drops the QWP cursor to terminate the stream.
+        // Requests end the in-flight query through the reader's CANCEL frame
+        // when the stream is next advanced; the connection itself stays
+        // reusable afterwards.
+        if let Some(query) = self.active.as_ref().and_then(Weak::upgrade) {
+            query.request();
+        }
         Ok(())
     }
 }

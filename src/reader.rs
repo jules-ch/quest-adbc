@@ -1,147 +1,138 @@
-use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::thread;
+use std::ops::DerefMut;
+use std::sync::Arc;
 
 use adbc_core::error::{Error as AdbcError, Status};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, SchemaRef};
-use questdb::egress::Reader;
+use questdb::egress::Cursor;
+use self_cell::{MutBorrow, self_cell};
 
-/// Owned streaming adapter for the QuestDB cursor API, whose cursor borrows its
-/// reader. A dedicated worker owns both QWP objects; a one-batch channel keeps
-/// memory bounded and transfers backpressure to the QWP reader.
-pub(crate) struct QuestDbBatchReader {
+use crate::cancellation::QueryCancellation;
+use crate::connection::ReaderGuard;
+
+// A QWP Cursor mutably borrows its Reader for the whole query, like the
+// PostgreSQL ADBC driver's TupleReader holds its borrowed PGconn. Keeping
+// the cursor and its checkout-guard in one owned, movable cell lets a
+// `Send + 'static` result drive both directly, with no worker thread.
+self_cell!(
+    struct ActiveQuery {
+        owner: MutBorrow<ReaderGuard>,
+
+        #[not_covariant]
+        dependent: Cursor,
+    }
+);
+
+/// Arrow result for one query. The reader holds the checkout guard while its
+/// query is in flight and pulls batches directly on `next()`; when finished
+/// (or dropped), the guard returns the native connection for reuse.
+pub(crate) struct QuestDbArrowStreamReader {
+    active: Option<ActiveQuery>,
     schema: SchemaRef,
     first_batch: Option<RecordBatch>,
-    receiver: Receiver<StreamMessage>,
+    cancellation: Arc<QueryCancellation>,
     finished: bool,
 }
 
-enum StreamMessage {
-    Batch(RecordBatch),
-    Error(AdbcError),
-}
-
-impl QuestDbBatchReader {
-    pub(crate) fn execute(conf: String, sql: String) -> adbc_core::error::Result<Self> {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let (first_sender, first_receiver) = mpsc::sync_channel(1);
-
-        thread::Builder::new()
-            .name("questdb-adbc-qwp-reader".into())
-            .spawn(move || run_query(conf, sql, sender, first_sender))
-            .map_err(|error| {
-                AdbcError::with_message_and_status(
-                    format!("could not start QuestDB query reader: {error}"),
-                    Status::Internal,
-                )
-            })?;
-
-        // QWP carries the result schema on its initial result batch. Waiting
-        // for that batch makes the ADBC schema available before execute returns.
-        let first_batch = first_receiver.recv().map_err(|_| {
-            AdbcError::with_message_and_status(
-                "QuestDB query reader stopped before returning a schema",
-                Status::IO,
-            )
-        })??;
-        let schema = first_batch.schema();
+impl QuestDbArrowStreamReader {
+    pub(crate) fn execute(
+        guard: ReaderGuard,
+        sql: String,
+        cancellation: Arc<QueryCancellation>,
+    ) -> adbc_core::error::Result<Self> {
+        let mut active = ActiveQuery::try_new(MutBorrow::new(guard), |owner| {
+            owner.borrow_mut().deref_mut().execute(sql)
+        })
+        .map_err(io_error)?;
+        let first_batch = schema_batch(&mut active)?;
 
         Ok(Self {
-            schema,
+            active: Some(active),
+            schema: first_batch.schema(),
             first_batch: Some(first_batch),
-            receiver,
+            cancellation,
             finished: false,
         })
     }
 }
 
-fn run_query(
-    conf: String,
-    sql: String,
-    sender: SyncSender<StreamMessage>,
-    first_sender: SyncSender<adbc_core::error::Result<RecordBatch>>,
-) {
-    let mut reader = match Reader::from_conf(&conf) {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = first_sender.send(Err(map_questdb_error(error.to_string())));
-            return;
-        }
-    };
-
-    let mut cursor = match reader.execute(sql) {
-        Ok(cursor) => cursor,
-        Err(error) => {
-            let _ = first_sender.send(Err(map_questdb_error(error.to_string())));
-            return;
-        }
-    };
-
-    let first_batch = match cursor.next_arrow_batch() {
-        Ok(Some(batch)) => batch,
-        Ok(None) => {
-            let _ = first_sender.send(Err(AdbcError::with_message_and_status(
-                "QuestDB ended the query before returning an Arrow schema",
-                Status::InvalidData,
-            )));
-            return;
-        }
-        Err(error) => {
-            let _ = first_sender.send(Err(map_questdb_error(error.to_string())));
-            return;
-        }
-    };
-
-    if first_sender.send(Ok(first_batch)).is_err() {
-        return;
-    }
-
-    loop {
-        match cursor.next_arrow_batch() {
-            Ok(Some(batch)) => {
-                if sender.send(StreamMessage::Batch(batch)).is_err() {
-                    return;
-                }
-            }
-            Ok(None) => return,
-            Err(error) => {
-                let _ = sender.send(StreamMessage::Error(map_questdb_error(error.to_string())));
-                return;
-            }
-        }
-    }
+fn io_error(error: impl std::fmt::Display) -> AdbcError {
+    AdbcError::with_message_and_status(error.to_string(), Status::IO)
 }
 
-fn map_questdb_error(message: String) -> AdbcError {
-    AdbcError::with_message_and_status(message, Status::IO)
+/// The first result batch. The QWP schema rides only this (possibly
+/// zero-row) batch, so an empty stream is an error: schema() would
+/// otherwise have no answer.
+fn schema_batch(active: &mut ActiveQuery) -> adbc_core::error::Result<RecordBatch> {
+    active
+        .with_dependent_mut(|_, cursor| cursor.next_arrow_batch())
+        .map_err(io_error)?
+        .ok_or(AdbcError::with_message_and_status(
+            "QuestDB ended the query before returning an Arrow schema",
+            Status::InvalidData,
+        ))
 }
 
-impl Iterator for QuestDbBatchReader {
+impl Iterator for QuestDbArrowStreamReader {
     type Item = Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.finished {
             return None;
         }
+
+        // Cancellation plays the role of the PG driver's PGcancel: end the
+        // query server-side through the cursor's CANCEL frame and bounded
+        // drain, which keeps the underlying connection reusable. A request
+        // is only recognised here, between batches — never while another
+        // thread is blocked reading the socket.
+        if self.cancellation.requested() {
+            let active = self.active.take();
+            if let Some(mut active) = active {
+                let _ = active.with_dependent_mut(|_, cursor| cursor.cancel());
+                self.finished = true;
+                return Some(Err(ArrowError::ExternalError(Box::new(
+                    AdbcError::with_message_and_status(
+                        "QuestDB query cancelled",
+                        Status::Cancelled,
+                    ),
+                ))));
+            }
+        }
+
         if let Some(batch) = self.first_batch.take() {
             return Some(Ok(batch));
         }
 
-        match self.receiver.recv() {
-            Ok(StreamMessage::Batch(batch)) => Some(Ok(batch)),
-            Ok(StreamMessage::Error(error)) => {
+        let outcome = self
+            .active
+            .as_mut()
+            .map(|active| active.with_dependent_mut(|_, cursor| cursor.next_arrow_batch()))
+            .unwrap_or_else(|| Ok(None));
+        match outcome {
+            Ok(Some(batch)) if batch.schema() == self.schema => Some(Ok(batch)),
+            Ok(Some(_)) => {
                 self.finished = true;
-                Some(Err(ArrowError::ExternalError(Box::new(error))))
+                self.active = None;
+                Some(Err(ArrowError::SchemaError(
+                    "QuestDB result schema changed during streaming".into(),
+                )))
             }
-            Err(_) => {
+            Ok(None) => {
                 self.finished = true;
+                self.active = None;
                 None
+            }
+            Err(error) => {
+                self.finished = true;
+                self.active = None;
+                Some(Err(ArrowError::ExternalError(Box::new(io_error(error)))))
             }
         }
     }
 }
 
-impl RecordBatchReader for QuestDbBatchReader {
+impl RecordBatchReader for QuestDbArrowStreamReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }

@@ -1,5 +1,7 @@
 //! Read-focused ADBC driver for QuestDB's QWP-over-WebSocket protocol.
 
+mod cancellation;
+mod connection;
 mod options;
 mod reader;
 mod schema;
@@ -7,12 +9,16 @@ mod statement;
 mod writer;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use adbc_core::error::{Error, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionDatabase, OptionValue};
 use adbc_core::{Connection, Database, Driver, Optionable};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
+
+use cancellation::CancellationRegistry;
+use connection::NativeConnection;
 
 pub use statement::QuestDbStatement;
 
@@ -66,7 +72,8 @@ impl Database for QuestDbDatabase {
             self.password.as_deref(),
         )?;
         let mut connection = QuestDbConnection {
-            conf,
+            native: Arc::new(NativeConnection::new(conf)),
+            cancellation: Arc::new(CancellationRegistry::default()),
             options: HashMap::new(),
         };
         for (key, value) in opts {
@@ -145,7 +152,8 @@ impl Optionable for QuestDbDatabase {
 }
 
 pub struct QuestDbConnection {
-    conf: String,
+    native: Arc<NativeConnection>,
+    cancellation: Arc<CancellationRegistry>,
     options: HashMap<String, String>,
 }
 
@@ -153,12 +161,16 @@ impl Connection for QuestDbConnection {
     type StatementType = QuestDbStatement;
 
     fn new_statement(&mut self) -> adbc_core::error::Result<Self::StatementType> {
-        Ok(QuestDbStatement::new(self.conf.clone()))
+        Ok(QuestDbStatement::new(
+            Arc::clone(&self.native),
+            Arc::clone(&self.cancellation),
+        ))
     }
 
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
-        // ADBC result readers own their query worker. Dropping the reader
-        // interrupts consumption and closes an unfinished cursor.
+        // Marks every result opened from this connection; each stream ends
+        // its query server-side when it is next advanced.
+        self.cancellation.cancel_all();
         Ok(())
     }
 
