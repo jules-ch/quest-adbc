@@ -140,6 +140,43 @@ fn active_result_blocks_same_connection_until_released() {
 }
 
 #[test]
+fn ddl_through_execute_yields_an_empty_result() {
+    let Some(database) = test_database() else {
+        return;
+    };
+    // DML/DDL has no result batches; execute() answers with an empty
+    // (zero-column) result instead of an error, and the connection becomes
+    // reusable right away.
+    let mut connection = database.new_connection().expect("connect to QuestDB");
+    let mut statement = connection.new_statement().expect("create statement");
+    statement
+        .set_sql_query("CREATE TABLE IF NOT EXISTS adbc_ddl_probe (x INT)")
+        .expect("set DDL");
+
+    let mut reader = statement.execute().expect("DDL with no result batches");
+    assert_eq!(reader.schema().fields().len(), 0);
+    assert!(reader.next().is_none());
+
+    statement
+        .set_sql_query("DROP TABLE IF EXISTS adbc_ddl_probe")
+        .expect("set DDL drop");
+    let mut reader = statement.execute().expect("DDL drop");
+    assert_eq!(reader.schema().fields().len(), 0);
+    assert!(reader.next().is_none());
+
+    // The schema-less DDL results did not strand the reader slot.
+    statement
+        .set_sql_query("SELECT x FROM long_sequence(2)")
+        .expect("set SQL");
+    let rows: usize = statement
+        .execute()
+        .expect("query after DDL")
+        .map(|batch| batch.expect("batch").num_rows())
+        .sum();
+    assert_eq!(rows, 2);
+}
+
+#[test]
 fn reexecuting_statement_invalidates_previous_result() {
     let Some(database) = test_database() else {
         return;

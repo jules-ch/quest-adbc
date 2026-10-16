@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use adbc_core::error::{Error as AdbcError, Status};
 use arrow_array::{RecordBatch, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use questdb::egress::Cursor;
 use self_cell::{MutBorrow, self_cell};
 
-use crate::cancellation::QueryCancellation;
+use crate::cancellation::CancellationToken;
 use crate::connection::ReaderGuard;
 
 // A QWP Cursor mutably borrows its Reader for the whole query, like the
@@ -22,15 +22,16 @@ self_cell!(
         dependent: Cursor,
     }
 );
-
 /// Arrow result for one query. The reader holds the checkout guard while its
 /// query is in flight and pulls batches directly on `next()`; when finished
-/// (or dropped), the guard returns the native connection for reuse.
+/// (or dropped), the guard returns the native connection for reuse. The
+/// checked-out query is registered with the native connection, so one flag
+/// serves both statement-level and connection-level cancellation.
 pub(crate) struct QuestDbArrowStreamReader {
     active: Option<ActiveQuery>,
     schema: SchemaRef,
     first_batch: Option<RecordBatch>,
-    cancellation: Arc<QueryCancellation>,
+    cancellation: Arc<CancellationToken>,
     finished: bool,
 }
 
@@ -38,39 +39,45 @@ impl QuestDbArrowStreamReader {
     pub(crate) fn execute(
         guard: ReaderGuard,
         sql: String,
-        cancellation: Arc<QueryCancellation>,
+        cancellation: Arc<CancellationToken>,
     ) -> adbc_core::error::Result<Self> {
         let mut active = ActiveQuery::try_new(MutBorrow::new(guard), |owner| {
             owner.borrow_mut().deref_mut().execute(sql)
         })
         .map_err(io_error)?;
-        let first_batch = schema_batch(&mut active)?;
+        let first_batch = active
+            .with_dependent_mut(|_, cursor| cursor.next_arrow_batch())
+            .map_err(io_error)?;
 
-        Ok(Self {
-            active: Some(active),
-            schema: first_batch.schema(),
-            first_batch: Some(first_batch),
-            cancellation,
-            finished: false,
-        })
+        match first_batch {
+            Some(first_batch) => Ok(Self {
+                active: Some(active),
+                schema: first_batch.schema(),
+                first_batch: Some(first_batch),
+                cancellation,
+                finished: false,
+            }),
+            None => {
+                // A query may end without any result batch — e.g. DML/DDL
+                // run through execute(). Such a cursor becomes an empty
+                // (zero-column) result instead of an error, like the
+                // ClickHouse driver handles schema-less cursor ends
+                // (adbc_clickhouse issue 49). The guard drops here and the
+                // reader goes straight back to its slot.
+                Ok(Self {
+                    active: None,
+                    schema: Arc::new(Schema::empty()),
+                    first_batch: None,
+                    cancellation,
+                    finished: true,
+                })
+            }
+        }
     }
 }
 
 fn io_error(error: impl std::fmt::Display) -> AdbcError {
     AdbcError::with_message_and_status(error.to_string(), Status::IO)
-}
-
-/// The first result batch. The QWP schema rides only this (possibly
-/// zero-row) batch, so an empty stream is an error: schema() would
-/// otherwise have no answer.
-fn schema_batch(active: &mut ActiveQuery) -> adbc_core::error::Result<RecordBatch> {
-    active
-        .with_dependent_mut(|_, cursor| cursor.next_arrow_batch())
-        .map_err(io_error)?
-        .ok_or(AdbcError::with_message_and_status(
-            "QuestDB ended the query before returning an Arrow schema",
-            Status::InvalidData,
-        ))
 }
 
 impl Iterator for QuestDbArrowStreamReader {
@@ -86,7 +93,7 @@ impl Iterator for QuestDbArrowStreamReader {
         // drain, which keeps the underlying connection reusable. A request
         // is only recognised here, between batches — never while another
         // thread is blocked reading the socket.
-        if self.cancellation.requested() {
+        if self.cancellation.is_cancelled() {
             let active = self.active.take();
             if let Some(mut active) = active {
                 let _ = active.with_dependent_mut(|_, cursor| cursor.cancel());

@@ -17,7 +17,6 @@ use adbc_core::{Connection, Database, Driver, Optionable};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
 
-use cancellation::CancellationRegistry;
 use connection::NativeConnection;
 
 pub use statement::QuestDbStatement;
@@ -73,7 +72,6 @@ impl Database for QuestDbDatabase {
         )?;
         let mut connection = QuestDbConnection {
             native: Arc::new(NativeConnection::new(conf)),
-            cancellation: Arc::new(CancellationRegistry::default()),
             options: HashMap::new(),
         };
         for (key, value) in opts {
@@ -153,7 +151,6 @@ impl Optionable for QuestDbDatabase {
 
 pub struct QuestDbConnection {
     native: Arc<NativeConnection>,
-    cancellation: Arc<CancellationRegistry>,
     options: HashMap<String, String>,
 }
 
@@ -161,16 +158,13 @@ impl Connection for QuestDbConnection {
     type StatementType = QuestDbStatement;
 
     fn new_statement(&mut self) -> adbc_core::error::Result<Self::StatementType> {
-        Ok(QuestDbStatement::new(
-            Arc::clone(&self.native),
-            Arc::clone(&self.cancellation),
-        ))
+        Ok(QuestDbStatement::new(Arc::clone(&self.native)))
     }
 
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
-        // Marks every result opened from this connection; each stream ends
-        // its query server-side when it is next advanced.
-        self.cancellation.cancel_all();
+        // Marks the connection's in-flight result, if any; its stream ends
+        // the query server-side when it is next advanced.
+        self.native.cancel_in_flight();
         Ok(())
     }
 

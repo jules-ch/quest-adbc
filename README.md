@@ -27,7 +27,7 @@ Concurrency and streaming semantics follow the official PostgreSQL C ADBC driver
 
 The native cursor mutably borrows the checked-out reader; a self-referential cell safely holds both inside the `Send + 'static` Arrow result reader, replacing the PG driver's `TupleReader`. Batches are pulled directly on `next()` — no background worker or batch buffer, honoring the pull-based `GetNext` contract. Statement or connection cancellation is recognized when an affected stream is next advanced: the query ends server-side through the cursor's CANCEL frame and a bounded drain, so the native connection itself stays reusable (the role of `PGcancel`). Arrow decoding and type conversion remain in the official QuestDB client.
 
-An empty result is supported when QuestDB sends its schema-bearing initial (possibly zero-row) result batch. A stream that ends before the server supplies a schema is reported as an error, since QWP schema is carried by a result batch.
+An empty result is supported when QuestDB sends its schema-bearing initial (possibly zero-row) result batch. A cursor that ends without any result batch — e.g. DML/DDL run through `execute()` — becomes an empty (zero-column) result instead of an error, in the manner of the ClickHouse driver's handling of schema-less cursor ends.
 
 ## Development tree
 

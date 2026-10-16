@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use adbc_core::error::{Error, Status};
 use adbc_core::options::{OptionStatement, OptionValue};
@@ -7,28 +7,26 @@ use adbc_core::{Optionable, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 
-use crate::cancellation::{CancellationRegistry, QueryCancellation};
+use crate::cancellation::CancellationToken;
 use crate::connection::NativeConnection;
 use crate::reader::QuestDbArrowStreamReader;
 use crate::writer;
 
 pub struct QuestDbStatement {
     connection: Arc<NativeConnection>,
-    cancellation: Arc<CancellationRegistry>,
-    active: Option<Weak<QueryCancellation>>,
+    /// The most recent execution's cancellation token, kept until replaced
+    /// by the next execute. `Statement::cancel` marks it; a second execute
+    /// invalidates it so its stream ends on the next advance.
+    query_cancel_token: Option<Arc<CancellationToken>>,
     sql: Option<String>,
     options: HashMap<String, String>,
 }
 
 impl QuestDbStatement {
-    pub(crate) fn new(
-        connection: Arc<NativeConnection>,
-        cancellation: Arc<CancellationRegistry>,
-    ) -> Self {
+    pub(crate) fn new(connection: Arc<NativeConnection>) -> Self {
         Self {
             connection,
-            cancellation,
-            active: None,
+            query_cancel_token: None,
             sql: None,
             options: HashMap::new(),
         }
@@ -58,14 +56,16 @@ impl Statement for QuestDbStatement {
         // the first call's result set. The invalidated stream reports its
         // cancellation when it is next advanced; until it has released the
         // connection, a new execute is refused with InvalidState.
-        if let Some(previous) = self.active.as_ref().and_then(Weak::upgrade) {
-            previous.request();
+        if let Some(previous) = self.query_cancel_token.as_ref() {
+            previous.cancel();
         }
-        let query = Arc::new(QueryCancellation::default());
-        let reader =
-            QuestDbArrowStreamReader::execute(self.connection.acquire()?, sql, Arc::clone(&query))?;
-        self.cancellation.register(&query);
-        self.active = Some(Arc::downgrade(&query));
+        let query = Arc::new(CancellationToken::default());
+        let reader = QuestDbArrowStreamReader::execute(
+            self.connection.acquire(Arc::clone(&query))?,
+            sql,
+            Arc::clone(&query),
+        )?;
+        self.query_cancel_token = Some(query);
         Ok(Box::new(reader))
     }
 
@@ -117,8 +117,8 @@ impl Statement for QuestDbStatement {
         // Requests end the in-flight query through the reader's CANCEL frame
         // when the stream is next advanced; the connection itself stays
         // reusable afterwards.
-        if let Some(query) = self.active.as_ref().and_then(Weak::upgrade) {
-            query.request();
+        if let Some(query) = self.query_cancel_token.as_ref() {
+            query.cancel();
         }
         Ok(())
     }
