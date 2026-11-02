@@ -1,34 +1,19 @@
-use std::ops::DerefMut;
 use std::sync::Arc;
 
 use adbc_core::error::{Error as AdbcError, Status};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::{ArrowError, Schema, SchemaRef};
-use questdb::egress::Cursor;
-use self_cell::{MutBorrow, self_cell};
 
+use crate::arrow_cursor::ArrowCursor;
 use crate::cancellation::CancellationToken;
-use crate::connection::ReaderGuard;
 
-// A QWP Cursor mutably borrows its Reader for the whole query, like the
-// PostgreSQL ADBC driver's TupleReader holds its borrowed PGconn. Keeping
-// the cursor and its checkout-guard in one owned, movable cell lets a
-// `Send + 'static` result drive both directly, with no worker thread.
-self_cell!(
-    struct ActiveQuery {
-        owner: MutBorrow<ReaderGuard>,
-
-        #[not_covariant]
-        dependent: Cursor,
-    }
-);
-/// Arrow result for one query. The reader holds the checkout guard while its
+/// Arrow result for one query. The cursor holds the checkout guard while its
 /// query is in flight and pulls batches directly on `next()`; when finished
 /// (or dropped), the guard returns the native connection for reuse. The
 /// checked-out query is registered with the native connection, so one flag
 /// serves both statement-level and connection-level cancellation.
 pub(crate) struct QuestDbArrowStreamReader {
-    active: Option<ActiveQuery>,
+    cursor: Option<ArrowCursor>,
     schema: SchemaRef,
     first_batch: Option<RecordBatch>,
     cancellation: Arc<CancellationToken>,
@@ -36,48 +21,43 @@ pub(crate) struct QuestDbArrowStreamReader {
 }
 
 impl QuestDbArrowStreamReader {
-    pub(crate) fn execute(
-        guard: ReaderGuard,
-        sql: String,
+    pub(crate) fn begin(
+        mut cursor: ArrowCursor,
         cancellation: Arc<CancellationToken>,
     ) -> adbc_core::error::Result<Self> {
-        let mut active = ActiveQuery::try_new(MutBorrow::new(guard), |owner| {
-            owner.borrow_mut().deref_mut().execute(sql)
-        })
-        .map_err(io_error)?;
-        let first_batch = active
-            .with_dependent_mut(|_, cursor| cursor.next_arrow_batch())
-            .map_err(io_error)?;
+        // Read the first batch so that `RecordBatchReader::schema()` is
+        // infallible, including the empty DDL/DML result case.
+        let first_batch = cursor.next_batch()?;
 
-        match first_batch {
-            Some(first_batch) => Ok(Self {
-                active: Some(active),
-                schema: first_batch.schema(),
-                first_batch: Some(first_batch),
+        let Some(first_batch) = first_batch else {
+            // DML/DDL may complete without producing a result batch.
+            // Drop the query and return an empty result.
+            return Ok(Self {
+                cursor: None,
+                schema: Arc::new(Schema::empty()),
+                first_batch: None,
                 cancellation,
-                finished: false,
-            }),
-            None => {
-                // A query may end without any result batch — e.g. DML/DDL
-                // run through execute(). Such a cursor becomes an empty
-                // (zero-column) result instead of an error, like the
-                // ClickHouse driver handles schema-less cursor ends
-                // (adbc_clickhouse issue 49). The guard drops here and the
-                // reader goes straight back to its slot.
-                Ok(Self {
-                    active: None,
-                    schema: Arc::new(Schema::empty()),
-                    first_batch: None,
-                    cancellation,
-                    finished: true,
-                })
-            }
-        }
+                finished: true,
+            });
+        };
+
+        let schema = first_batch.schema();
+
+        Ok(Self {
+            cursor: Some(cursor),
+            schema,
+            first_batch: Some(first_batch),
+            cancellation,
+            finished: false,
+        })
     }
 }
 
-fn io_error(error: impl std::fmt::Display) -> AdbcError {
-    AdbcError::with_message_and_status(error.to_string(), Status::IO)
+fn cancellation_error() -> ArrowError {
+    ArrowError::ExternalError(Box::new(AdbcError::with_message_and_status(
+        "QuestDB query cancelled",
+        Status::Cancelled,
+    )))
 }
 
 impl Iterator for QuestDbArrowStreamReader {
@@ -94,16 +74,11 @@ impl Iterator for QuestDbArrowStreamReader {
         // is only recognised here, between batches — never while another
         // thread is blocked reading the socket.
         if self.cancellation.is_cancelled() {
-            let active = self.active.take();
-            if let Some(mut active) = active {
-                let _ = active.with_dependent_mut(|_, cursor| cursor.cancel());
+            let cursor = self.cursor.take();
+            if let Some(mut cursor) = cursor {
+                let _ = cursor.cancel();
                 self.finished = true;
-                return Some(Err(ArrowError::ExternalError(Box::new(
-                    AdbcError::with_message_and_status(
-                        "QuestDB query cancelled",
-                        Status::Cancelled,
-                    ),
-                ))));
+                return Some(Err(cancellation_error()));
             }
         }
 
@@ -112,28 +87,28 @@ impl Iterator for QuestDbArrowStreamReader {
         }
 
         let outcome = self
-            .active
+            .cursor
             .as_mut()
-            .map(|active| active.with_dependent_mut(|_, cursor| cursor.next_arrow_batch()))
+            .map(ArrowCursor::next_batch)
             .unwrap_or_else(|| Ok(None));
         match outcome {
             Ok(Some(batch)) if batch.schema() == self.schema => Some(Ok(batch)),
             Ok(Some(_)) => {
                 self.finished = true;
-                self.active = None;
+                self.cursor = None;
                 Some(Err(ArrowError::SchemaError(
                     "QuestDB result schema changed during streaming".into(),
                 )))
             }
             Ok(None) => {
                 self.finished = true;
-                self.active = None;
+                self.cursor = None;
                 None
             }
-            Err(error) => {
+            Err(failure) => {
                 self.finished = true;
-                self.active = None;
-                Some(Err(ArrowError::ExternalError(Box::new(io_error(error)))))
+                self.cursor = None;
+                Some(Err(ArrowError::ExternalError(Box::new(failure))))
             }
         }
     }
@@ -142,6 +117,19 @@ impl Iterator for QuestDbArrowStreamReader {
 impl RecordBatchReader for QuestDbArrowStreamReader {
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
+    }
+}
+
+impl Drop for QuestDbArrowStreamReader {
+    fn drop(&mut self) {
+        // Dropping a partially consumed result is common in ADBC (e.g. a
+        // caller stops after LIMIT or an error). Send CANCEL and drain
+        // server-side so the native Reader stays reusable; without this the
+        // cursor's own Drop would tear down the WebSocket and force the next
+        // query to reconnect.
+        if let Some(mut cursor) = self.cursor.take() {
+            let _ = cursor.cancel();
+        }
     }
 }
 

@@ -7,13 +7,14 @@ use adbc_core::{Optionable, Statement};
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::Schema;
 
+use crate::arrow_cursor::ArrowCursor;
 use crate::cancellation::CancellationToken;
-use crate::connection::NativeConnection;
+use crate::qwp_connection::QwpConnection;
 use crate::reader::QuestDbArrowStreamReader;
 use crate::writer;
 
 pub struct QuestDbStatement {
-    connection: Arc<NativeConnection>,
+    connection: Arc<QwpConnection>,
     /// The most recent execution's cancellation token, kept until replaced
     /// by the next execute. `Statement::cancel` marks it; a second execute
     /// invalidates it so its stream ends on the next advance.
@@ -23,7 +24,7 @@ pub struct QuestDbStatement {
 }
 
 impl QuestDbStatement {
-    pub(crate) fn new(connection: Arc<NativeConnection>) -> Self {
+    pub(crate) fn new(connection: Arc<QwpConnection>) -> Self {
         Self {
             connection,
             query_cancel_token: None,
@@ -60,11 +61,8 @@ impl Statement for QuestDbStatement {
             previous.cancel();
         }
         let query = Arc::new(CancellationToken::default());
-        let reader = QuestDbArrowStreamReader::execute(
-            self.connection.acquire(Arc::clone(&query))?,
-            sql,
-            Arc::clone(&query),
-        )?;
+        let cursor = ArrowCursor::execute(self.connection.acquire(Arc::clone(&query))?, sql)?;
+        let reader = QuestDbArrowStreamReader::begin(cursor, Arc::clone(&query))?;
         self.query_cancel_token = Some(query);
         Ok(Box::new(reader))
     }
