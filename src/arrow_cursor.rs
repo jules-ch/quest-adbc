@@ -1,19 +1,18 @@
-use std::ops::DerefMut;
-
 use arrow_array::RecordBatch;
-use questdb::egress::Cursor;
+use questdb::egress::{Cursor, Terminal};
+use questdb::ffi_support::OwnedReader;
 use self_cell::{MutBorrow, self_cell};
 
 use crate::error;
-use crate::qwp_connection::ReaderGuard;
 
 // A QWP Cursor mutably borrows its Reader for the whole query, like the
-// PostgreSQL ADBC driver's TupleReader holds its borrowed PGconn. Keeping the
-// cursor and its checkout-guard in one owned, movable cell lets the cursor be
-// driven from a `Send + 'static` result without a worker thread.
+// PostgreSQL ADBC driver's TupleReader holds its borrowed PGconn. The pool
+// hands out an owned reader lease; keeping that lease and the borrowed cursor
+// in one movable cell lets the cursor be driven from a `Send + 'static`
+// result without a worker thread.
 self_cell!(
     struct ActiveQuery {
-        owner: MutBorrow<ReaderGuard>,
+        owner: MutBorrow<OwnedReader>,
 
         #[not_covariant]
         dependent: Cursor,
@@ -28,9 +27,9 @@ pub(crate) struct ArrowCursor {
 }
 
 impl ArrowCursor {
-    pub(crate) fn execute(guard: ReaderGuard, sql: String) -> adbc_core::error::Result<Self> {
-        let active = ActiveQuery::try_new(MutBorrow::new(guard), |owner| {
-            owner.borrow_mut().deref_mut().execute(sql)
+    pub(crate) fn execute(reader: OwnedReader, sql: String) -> adbc_core::error::Result<Self> {
+        let active = ActiveQuery::try_new(MutBorrow::new(reader), |owner| {
+            owner.borrow_mut().get_mut().execute(sql)
         })
         .map_err(error::from_questdb)?;
         Ok(Self { active })
@@ -46,5 +45,11 @@ impl ArrowCursor {
         self.active
             .with_dependent_mut(|_, cursor| cursor.cancel())
             .map_err(error::from_questdb)
+    }
+
+    /// The terminal frame observed after the last batch was drained.
+    pub(crate) fn terminal(&self) -> Option<Terminal> {
+        self.active
+            .with_dependent(|_, cursor| cursor.terminal().cloned())
     }
 }

@@ -1,10 +1,16 @@
-//! Read-focused ADBC driver for QuestDB's QWP-over-WebSocket protocol.
+//! ADBC driver for QuestDB's QWP-over-WebSocket protocol.
+//!
+//! Supports streaming query results and bulk ingestion through QWP. SQL DML and
+//! DDL executed with [`adbc_core::Statement::execute_update`] report the row
+//! counts sent by QuestDB, while [`adbc_core::Statement::execute`] streams Arrow
+//! batches incrementally.
 
 mod arrow_cursor;
 mod cancellation;
 mod connection;
 mod database;
 mod error;
+mod info;
 mod options;
 mod qwp_connection;
 mod reader;

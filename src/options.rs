@@ -20,7 +20,7 @@ pub(crate) fn option_string(value: OptionValue, option: &str) -> adbc_core::erro
 
 pub(crate) fn read_only_error() -> Error {
     Error::with_message_and_status(
-        "QuestDB ADBC MVP is read-only; writes and transactions are not implemented",
+        "QuestDB ADBC runs in autocommit mode; explicit transactions are not implemented",
         Status::NotImplemented,
     )
 }

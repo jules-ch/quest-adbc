@@ -1,150 +1,106 @@
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
-use adbc_core::error::{Error, Result, Status};
+use adbc_core::error::Result;
 use arrow_array::RecordBatch;
-use questdb::egress::Reader;
+use questdb::QuestDb;
+// `OwnedReader` is in questdb-rs's FFI escape hatch: the stable API only
+// exposes lifetime-bound reader borrows. Pin questdb-rs exactly in Cargo.toml
+// so a minor release cannot change this surface unnoticed.
+use questdb::ffi_support::borrow_reader_owned;
 
 use crate::arrow_cursor::ArrowCursor;
 use crate::cancellation::CancellationToken;
+use crate::error;
 
-/// The single native QWP connection owned by one logical ADBC connection —
-/// the Rust analog of the PostgreSQL ADBC driver's `PGconn* conn_`. QWP,
-/// like libpq, carries at most one query in flight, so the socket stays
-/// healthy across queries and reconnects only after a transport failure.
+/// The QWP pool owned by one logical ADBC connection. Both queries and
+/// ingestion borrow from the same pool; `QuestDb` keeps its reader and sender
+/// pools independent, so an open result set can never block an ingest flush.
 pub(crate) struct QwpConnection {
     conf: String,
-    state: Mutex<ConnectionState>,
-}
-
-#[derive(Default)]
-struct ConnectionState {
-    reader: Option<Reader>,
-    busy: bool,
-    /// The in-flight query's cancellation register. Because a single reader
-    /// can carry at most one query, `Connection::cancel` only ever has to
-    /// reach this one.
-    in_flight: Option<Arc<CancellationToken>>,
+    /// Opened lazily on first use. `QuestDb` is `Send + Sync`, so the `Arc` is
+    /// cloned out before any network I/O.
+    pool: Mutex<Option<Arc<QuestDb>>>,
+    /// Cancellation registers for queries currently checked out of the reader
+    /// pool. A pooled connection may have several results in flight, so
+    /// `Connection::cancel` marks all of them.
+    in_flight: Mutex<Vec<Weak<CancellationToken>>>,
 }
 
 impl QwpConnection {
     pub(crate) fn new(conf: String) -> Self {
         Self {
             conf,
-            state: Mutex::new(ConnectionState::default()),
+            pool: Mutex::new(None),
+            in_flight: Mutex::new(Vec::new()),
         }
     }
 
-    /// `Connection::cancel`: marks the in-flight query of this connection,
-    /// if any. A query started after this call replaces the slot and runs
-    /// unharmed — the same semantics as marking a live-query list would
-    /// have.
-    pub(crate) fn cancel_in_flight(&self) {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(query) = state.in_flight.as_ref() {
-            query.cancel();
+    /// The shared QWP pool, created on first use from the connection's
+    /// configuration. Cloning the `Arc` out before any borrow keeps network
+    /// I/O out of the pool mutex.
+    pub(crate) fn pool(&self) -> Result<Arc<QuestDb>> {
+        let mut slot = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pool) = slot.as_ref() {
+            return Ok(Arc::clone(pool));
         }
+        let pool = Arc::new(QuestDb::connect(&self.conf).map_err(error::from_questdb)?);
+        *slot = Some(Arc::clone(&pool));
+        Ok(pool)
     }
 
-    /// Check out the connection's reader for one in-flight query (the analog
-    /// of the PG driver's reader occupying `conn_` while its cursor is
-    /// active). A second checkout is refused with `InvalidState` while the
-    /// first result is still active. Dropping the guard returns a healthy
-    /// reader to the slot; a torn-down transport is discarded so the next
-    /// checkout reconnects, mirroring libpq's reset behavior. The socket is
-    /// opened lazily on the first query.
-    pub(crate) fn acquire(
-        self: &Arc<Self>,
+    /// Borrow a reader from the pool and start one query on it. The returned
+    /// cursor owns the reader lease, so it stays `Send + 'static` without
+    /// holding a lock for the lifetime of the result stream.
+    pub(crate) fn execute(
+        &self,
         cancellation: Arc<CancellationToken>,
-    ) -> Result<ReaderGuard> {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if state.busy {
-            return Err(Error::with_message_and_status(
-                "another result is active on this QuestDB connection",
-                Status::InvalidState,
-            ));
-        }
+        sql: String,
+    ) -> Result<ArrowCursor> {
+        let pool = self.pool()?;
+        let reader = borrow_reader_owned(&pool).map_err(error::from_questdb)?;
+        self.register(&cancellation);
+        ArrowCursor::execute(reader, sql)
+    }
 
-        // The reconnect path performs network I/O, but only when no healthy
-        // connection is stored; holding the mutex keeps the one-at-a-time
-        // invariant panic-safe even if the connect attempt unwinds.
-        let reused = state
-            .reader
-            .take()
-            .filter(|reader| !reader.transport_torn_down());
-        let reader = match reused {
-            Some(reader) => reader,
-            None => Reader::from_conf(&self.conf)
-                .map_err(|error| Error::with_message_and_status(error.to_string(), Status::IO))?,
-        };
-        state.busy = true;
-        state.in_flight = Some(cancellation);
-        Ok(ReaderGuard {
-            reader: Some(reader),
-            connection: Arc::clone(self),
-        })
+    /// Register a query for connection-level cancellation. Dead entries from
+    /// finished statements are pruned here so the list stays bounded.
+    fn register(&self, cancellation: &Arc<CancellationToken>) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        in_flight.retain(|query| query.strong_count() > 0);
+        in_flight.push(Arc::downgrade(cancellation));
+    }
+
+    /// `Connection::cancel`: mark every query still in flight on this logical
+    /// connection. Queries started after this call are unaffected.
+    pub(crate) fn cancel_in_flight(&self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for query in in_flight.drain(..) {
+            if let Some(query) = query.upgrade() {
+                query.cancel();
+            }
+        }
     }
 
     /// Run one query to completion and return all of its Arrow batches. The
     /// metadata methods use this because they need the whole result in hand
     /// before they can build an ADBC response batch.
-    pub(crate) fn query_batches(self: &Arc<Self>, sql: &str) -> Result<Vec<RecordBatch>> {
-        let guard = self.acquire(Arc::new(CancellationToken::default()))?;
-        collect_batches(guard, sql.to_owned())
-    }
-}
-
-/// Execute a metadata-style query and drain every batch before returning the
-/// native connection to its slot. Used by the ADBC metadata methods, which
-/// need complete, in-memory results rather than a streaming reader.
-fn collect_batches(guard: ReaderGuard, sql: String) -> Result<Vec<RecordBatch>> {
-    let mut cursor = ArrowCursor::execute(guard, sql)?;
-
-    let mut batches = Vec::new();
-    loop {
-        match cursor.next_batch()? {
-            Some(batch) => batches.push(batch),
-            None => return Ok(batches),
+    pub(crate) fn query_batches(&self, sql: &str) -> Result<Vec<RecordBatch>> {
+        let mut cursor = self.execute(Arc::new(CancellationToken::default()), sql.to_owned())?;
+        let mut batches = Vec::new();
+        loop {
+            match cursor.next_batch()? {
+                Some(batch) => batches.push(batch),
+                None => return Ok(batches),
+            }
         }
-    }
-}
-
-/// Exclusive checkout of the connection's native reader until one query
-/// finishes or is abandoned. Guards the slot: dropping it (also on panic or
-/// unwind) puts a healthy reader back, frees the busy flag, and forgets the
-/// query it belonged to.
-pub(crate) struct ReaderGuard {
-    reader: Option<Reader>,
-    /// Back-reference driving the return trip.
-    connection: Arc<QwpConnection>,
-}
-
-impl Deref for ReaderGuard {
-    type Target = Reader;
-
-    fn deref(&self) -> &Self::Target {
-        self.reader.as_ref().expect("reader checked out")
-    }
-}
-
-impl DerefMut for ReaderGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.reader.as_mut().expect("reader checked out")
-    }
-}
-
-impl Drop for ReaderGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .connection
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let reader = self.reader.take().expect("reader checked out");
-        if !reader.transport_torn_down() {
-            state.reader = Some(reader);
-        }
-        state.busy = false;
-        state.in_flight = None;
     }
 }

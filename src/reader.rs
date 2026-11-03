@@ -7,11 +7,11 @@ use arrow_schema::{ArrowError, Schema, SchemaRef};
 use crate::arrow_cursor::ArrowCursor;
 use crate::cancellation::CancellationToken;
 
-/// Arrow result for one query. The cursor holds the checkout guard while its
-/// query is in flight and pulls batches directly on `next()`; when finished
-/// (or dropped), the guard returns the native connection for reuse. The
-/// checked-out query is registered with the native connection, so one flag
-/// serves both statement-level and connection-level cancellation.
+/// Arrow result for one query. The cursor owns its pooled reader lease while
+/// the query is in flight and pulls batches directly on `next()`; when finished
+/// (or dropped), the lease returns the reader to the QWP pool. The query is
+/// registered with the logical connection, so one token serves both
+/// statement-level and connection-level cancellation.
 pub(crate) struct QuestDbArrowStreamReader {
     cursor: Option<ArrowCursor>,
     schema: SchemaRef,

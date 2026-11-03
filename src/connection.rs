@@ -7,20 +7,21 @@ use adbc_core::{Connection, Optionable};
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
 
+use crate::info;
 use crate::options;
 use crate::qwp_connection::QwpConnection;
 use crate::statement::QuestDbStatement;
 
 /// An ADBC connection backed by one logical QWP connection.
 pub struct QuestDbConnection {
-    native: Arc<QwpConnection>,
+    qwp_connection: Arc<QwpConnection>,
     options: HashMap<String, String>,
 }
 
 impl QuestDbConnection {
-    pub(crate) fn new(native: Arc<QwpConnection>) -> Self {
+    pub(crate) fn new(qwp_connection: Arc<QwpConnection>) -> Self {
         Self {
-            native,
+            qwp_connection,
             options: HashMap::new(),
         }
     }
@@ -30,21 +31,21 @@ impl Connection for QuestDbConnection {
     type StatementType = QuestDbStatement;
 
     fn new_statement(&mut self) -> adbc_core::error::Result<Self::StatementType> {
-        Ok(QuestDbStatement::new(Arc::clone(&self.native)))
+        Ok(QuestDbStatement::new(Arc::clone(&self.qwp_connection)))
     }
 
     fn cancel(&mut self) -> adbc_core::error::Result<()> {
         // Marks the connection's in-flight result, if any; its stream ends
         // the query server-side when it is next advanced.
-        self.native.cancel_in_flight();
+        self.qwp_connection.cancel_in_flight();
         Ok(())
     }
 
     fn get_info(
         &self,
-        _codes: Option<std::collections::HashSet<InfoCode>>,
+        codes: Option<std::collections::HashSet<InfoCode>>,
     ) -> adbc_core::error::Result<Box<dyn RecordBatchReader + Send + 'static>> {
-        Err(options::unsupported("get_info"))
+        info::get_info(&self.qwp_connection, codes)
     }
 
     fn get_objects(
